@@ -411,7 +411,174 @@ Notes / Tips for the assistant you call
 Be explicit about column names encountered in the CSVs (they use quoted headers). Normalize and map them into snake_case.
 Use season as the CV unit to avoid target leakage.
 Persist preprocessing pipeline (scaler, encoders, imputation rules) with joblib so the same transformations apply to 2025 projections.
-If you want, I can:
 
-produce an executable starter repository scaffold (file list + minimal code) you can drop into your project, or
-generate the full Python scripts and a runnable notebook implementing this pipeline end‑to‑end. Which would you prefer?
+
+Goal
+
+Implement a reproducible ETL + analysis pipeline in Python that:
+Ingests historical TE CSVs (2020–2024 TE and TEADD files) and a 2025 projection file (2025TEPROJ.csv).
+Cleans, normalizes, and validates all inputs.
+Engineers features and historical aggregates.
+Produces a reliability-adjusted composite ranking of TEs for 2025 and generates a human-readable report, charts, and machine-readable outputs.
+Inputs (paths)
+
+data/pro/te/YYYYTE.csv (raw seasonal stats)
+data/pro/te/YYYYTEADD.csv (targets, %TM, FPTS, FPTS/G, roster %, etc.)
+projections/2025TEPROJ.csv
+Important input quirks to handle
+
+Numbers contain commas and are quoted: e.g., "1,115.4"
+Extraneous empty lines or trailing quoted empty rows
+Player names include team suffixes in parentheses: "Travis Kelce (KC)"; projections may omit team parenthesis
+Missing values, zeros, and "FA"/"–" style entries
+Some files are projections, not observed seasons — tag them appropriately
+Deliverables
+
+scripts/
+etl.py : ingestion + cleaning functions (clean numbers, strip quotes, normalize names)
+features.py : feature engineering and historical aggregations
+scoring.py : composite score calculation (configurable weights) and optional model training
+viz.py : plotting helpers (correlation heatmap, importance bars, proj vs hist scatter)
+cli.py : command-line interface supporting config file and CLI overrides
+notebooks/
+analysis.ipynb : interactive exploration and demo of ranking
+outputs/
+ranked_2025_te.csv (columns: rank, player, team, proj_fpts, hist_mean_fpts, composite_score, components...)
+ranked_2025_te.json
+report/2025_te_report.md (Top-10 narrative, key metrics, caveats)
+figs/*.png
+requirements.txt, Dockerfile (optional)
+tests/
+test_etl.py (parsing edge cases)
+test_merge.py (name normalization & merging)
+test_scoring.py (score reproducibility)
+Functional requirements — step by step
+
+Ingest & normalize
+Read CSVs robustly: use pandas.read_csv with:
+quotechar='"', skip_blank_lines=True, engine='python' (if needed)
+Thousand separators handled: remove commas before numeric cast
+Normalize header names (lowercase, underscore)
+Remove rows with blank Player fields
+Normalize player names:
+Remove trailing " (TEAM)" and trailing whitespace
+Remove extraneous suffix tokens like "Sr.", "IV" only if safe (keep them if needed for disambiguation)
+Lowercase or titlecase consistently
+Create canonical player id: normalized_name + maybe team for disambiguation
+Parse numeric fields: 1,234.5 → float 1234.5; missing strings to NaN
+Feature engineering (per-season + per-projection)
+From TEADD when available:
+targets (TGT), target_share (%TM), FPTS, FPTS/G, roster %
+From TE files:
+receptions (REC), yards (YDS), Y/R, air_yards (AIR), air_yards_per_target (AIR/R), YAC, YAC/R, red_zone_targets (RZ_TGT), TDs
+Derived features:
+tgt_per_game = TGT / G (if TGT exists), or REC/G as proxy
+fpts_per_game = FPTS / G
+historical_aggregates for last N seasons (N configurable, default 3):
+hist_mean_fpts, hist_sd_fpts, hist_availability = games_played / (17*N)
+hist_mean_tgt, hist_mean_target_share
+Projection-derived features (from 2025TEPROJ.csv):
+proj_rec, proj_yds, proj_tds, proj_fpts
+proj_tgt proxy: if no TGT, estimate TGT = proj_rec / typical_catch_rate (estimate per-player from history or use positional avg)
+proj_target_share = estimated using team pass attempts if available, otherwise proportional scaling from historical %TM (fallback)
+proj_rz_tgt: estimate as (historical RZ share) * estimated team target volume (optional)
+Name matching & merging
+Implement robust join logic:
+Exact match on normalized name if available
+Fuzzy match fallback (fuzzywuzzy/token_set_ratio) if no exact match and confidence > threshold
+Keep a match log and manual mapping file (name_map.csv) for ambiguous cases
+Composite scoring (default, configurable)
+Default normalized features: projected_fpts, hist_mean_fpts, proj_tgt_or_rec, proj_rz_tgt, hist_availability
+Normalization: min-max or robust scaling across candidate set (avoid leakage from projected zeros)
+Default weights:
+projected_fpts: 0.55
+hist_mean_fpts: 0.20
+projected_volume (proj_rec or estimated TGT): 0.10
+projected_rz_tgt: 0.08
+hist_availability: 0.05
+Compute CompositeScore = weighted sum of normalized components
+Provide configuration for weights (YAML or CLI params)
+Produce alternate ranking:
+ceiling-first: Composite_Ceiling = CompositeScore * (1 + 0.1*norm(AIR)) (configurable)
+safety-first: Composite_Safe = CompositeScore - 0.1*norm(hist_sd_fpts)
+Optional: Predictive model
+Train a regularized linear model (Ridge or Lasso) or tree (RandomForest) to predict FPTS using features (historical features → next-season FPTS). Use cross-validation (k=5).
+Output feature coefficients/importances and use SHAP summary for interpretability if tree model used.
+Report RMSE, MAE, R^2.
+Use model to produce reliability-adjusted projection: AdjProj = alpha * proj_fpts + (1-alpha) * model_pred (alpha configurable)
+Visualizations & report
+Correlation heatmap between features and FPTS (historical)
+Bar chart of feature importances (model coef or permutation importance)
+Scatter plot projected_fpts vs hist_mean_fpts colored by composite score
+Top-10 table with small narrative lines for each (auto-generate bullet points using rules: high target share, high RZ share, injury risk, etc.)
+Tests & CI
+Unit tests for:
+numeric parsing (commas, quotes)
+name normalization and fuzzy match behavior
+scoring normalization and reproducibility (seeded)
+CI: run tests on push (GitHub Actions)
+Linting: flake8 / black formatting
+Performance & scaling
+Data volumes small — optimize for clarity and correctness (pandas in-memory)
+Use chunked reading if needed for extremely large files
+Logging of all transformations (logging module) and an audit CSV that records each player’s merged rows & source files
+CLI / config usage examples
+Provide config.yml:
+input_paths: [...]
+years: [2020,2021,2022,2023,2024]
+proj_path: projections/2025TEPROJ.csv
+n_history_seasons: 3
+scoring_weights: {proj_fpts:0.55, hist_fpts:0.20, volume:0.10, rz:0.08, avail:0.05}
+CLI examples:
+python cli.py run --config config.yml
+python cli.py score --weights '{"proj_fpts":0.6,"hist_fpts":0.2,...}'
+python cli.py export --format csv,json
+Acceptance criteria
+
+Pipeline runs end-to-end with the given data, producing ranked_2025_te.csv and a 1–2 page Markdown report.
+All numeric parsing edge cases are handled and tested.
+Matching log shows < 2% unmatched players (or provides manual mapping file).
+CompositeScore is reproducible given config and seed.
+Notebook demonstrates usage and shows top-10 ranking with charts.
+Security/privacy and reproducibility
+
+Avoid calling external APIs in pipeline; rely on provided CSVs.
+Pin dependency versions in requirements.txt.
+Provide Dockerfile (python:3.10 or 3.11) for reproducibility.
+Example minimal function signatures to implement
+
+def read_te_csv(path: str) -> pd.DataFrame
+def clean_player_name(name: str) -> str
+def parse_numeric_column(series: pd.Series) -> pd.Series
+def compute_season_features(df_te: pd.DataFrame, df_teadd: pd.DataFrame) -> pd.DataFrame
+def aggregate_history(list_of_seasons: List[pd.DataFrame], n: int) -> pd.DataFrame
+def merge_projections(hist_agg: pd.DataFrame, proj_df: pd.DataFrame) -> pd.DataFrame
+def compute_composite_score(df: pd.DataFrame, weights: Dict[str, float]) -> pd.DataFrame
+def train_predictive_model(X: pd.DataFrame, y: pd.Series) -> ModelResult
+Example expected outputs (first 3 columns)
+
+ranked_2025_te.csv
+rank, player, team, proj_fpts, hist_mean_fpts, proj_rec, proj_yds, proj_tds, composite_score, reason_notes
+Optional extras (if you want)
+
+Provide a web UI (Streamlit) to change weights and see top-10 update live.
+Add Monte Carlo simulation for TD regression uncertainty.
+Copyable ready-to-use prompt (single block)
+
+Use this exact block when you want the assistant to produce all files, tests, and a notebook.
+
+Implement a Python data pipeline for fantasy TE ranking with the following requirements:
+
+Inputs: historical CSVs (data/pro/te/YYYYTE.csv and YYYYTEADD.csv for multiple years) and projections/2025TEPROJ.csv.
+Robust ingestion and cleaning: handle quoted numbers with commas, empty rows, trailing blank quoted lines, and strip team suffixes like " (KC)" from player names. Provide a canonical name function and a name_map fallback for ambiguous matches.
+Feature engineering:
+Extract TGT, %TM, REC, YDS, AIR, YAC, RZ_TGT, TD, FPTS, FPTS/G, G, etc.
+Compute derived metrics: tgt_per_game, fpts_per_game, projected target share (if TGT missing estimate from REC and catch rate), and historical aggregates (hist_mean_fpts, hist_sd_fpts, hist_avail across last N seasons).
+Merging: robust merge of projection file with historical aggregate using canonical names and fuzzy matching fallback.
+Scoring: implement a configurable CompositeScore with default weights: projected_fpts 0.55, hist_mean_fpts 0.20, projected_volume 0.10, projected_rz_tgt 0.08, hist_avail 0.05. Normalize features before weighting. Provide optional ceiling and stability variants.
+Model (optional): train a Ridge regression (or RandomForest) to predict FPTS from historical features; output feature importances and CV metrics.
+Outputs: ranked_2025_te.csv (rank, player, team, proj_fpts, hist_mean_fpts, composite_score and components), ranked_2025_te.json, report/2025_te_report.md with top-10 bullets, figs (correlation heatmap, feature importance, proj_vs_hist scatter).
+Deliver code as modular scripts (etl.py, features.py, scoring.py, viz.py, cli.py), a Jupyter notebook demo, requirements.txt, unit tests (parsing, merging, scoring) and a GitHub Actions CI workflow that runs tests and linting.
+Provide usage examples: python cli.py run --config config.yml and reproducible environment (requirements.txt or Dockerfile).
+Include logging and an audit CSV listing all merges and unmatched players.
+Make sure each function has type hints, docstrings, and is unit-tested. If any assumptions are needed, explicitly list them in the repo README.
