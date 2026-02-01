@@ -294,3 +294,124 @@ Ask a single clarifying question only if a critical input is missing (e.g., do y
 Keep the code modular and well-documented. Add inline comments for any domain‑specific logic (e.g., archetype thresholds).
 Provide a short usage README at the end of the PR and a summary of results (top 10 scored RBs and a couple of generated plots).
 
+
+Task
+
+Implement a reproducible Python pipeline that trains a supervised model to classify/score wide receivers as “top performers” using historical season CSVs (2020–2024) and applies the model to 2025 projected totals (2025WRPROJ.csv).
+Use a classification target: season is a “top” WR if it finishes in the top 24 WRs by season FPTS (from <year>WRADD.csv). Also provide regression results predicting season FPTS as a secondary output.
+Requirements — environment & libraries
+
+Language: Python 3.10+
+Required libraries: pandas, numpy, scikit-learn, xgboost or lightgbm (pick one), optuna (hyperparam tuning), shap, matplotlib / seaborn, joblib, pyarrow (for faster I/O).
+Use random_state/seed consistently for reproducibility.
+Provide a requirements.txt with pinned versions.
+Input files (assume local paths)
+
+data/pro/wr/{year}WR.csv and data/pro/wr/{year}WRADD.csv for years 2020,2021,2022,2023,2024
+data/pro/wr/2025WRPROJ.csv (projections)
+High-level pipeline steps
+
+Ingest & normalize:
+
+Read all WR.csv and WRADD.csv for 2020–2024 and concatenate into a season‑level table.
+Read 2025WRPROJ.csv into a projections table.
+Normalize player names: strip trailing team parentheses (e.g., "Davante Adams (LAR)" -> "Davante Adams"), unify spacing & accents, lower/strip.
+Ensure consistent column types (ints/floats), parse quoted CSV correctly.
+Feature engineering (historical seasons):
+
+From WR.csv and WRADD.csv build features per player-season:
+Direct columns to include: G, TGT, % TM, REC, YDS, Y/R, AIR, AIR/R, YAC, YAC/REC (or YACON/YACON/R), RZ TGT, 10+,20+,30+, CATCHABLE, DROP, BRKTKL, FPTS, FPTS/G, ROST.
+Derived features:
+catch_rate = REC / TGT (handle TGT==0)
+yac_per_rec = YAC / REC
+air_share_est = AIR / team_pass_air proxy (if team totals not available, normalize AIR by season cohort median or use AIR/R)
+target_share = TGT (use % TM when present)
+big_play_rate = (20+ + 30+ maybe) / REC or per game
+redzone_share = RZ_TGT / TGT (if TGT>0)
+per_game metrics: YDS_per_game = YDS / G, REC_per_game = REC / G, TGT_per_game = TGT / G
+trailing features: lag1_TGT, lag1_AIR, lag1_FPTS (previous season values)
+yoy change features: d_TGT = TGT - lag1_TGT, pct_d_TGT, etc.
+Document imputation rules and create a boolean flag for imputed features.
+Label creation:
+
+For each season (2020–2024) sort players by season FPTS (from WRADD). Create binary label top24 = 1 if rank <= 24 else 0.
+Also store top12 and top36 labels optionally for alternative thresholds.
+Keep the season as an identifier for CV.
+Training / validation strategy:
+
+Use leave‑one‑season‑out cross‑validation: train on 4 seasons, validate on the left‑out season; rotate for all 5 folds. This emulates out‑of‑time test.
+For each fold, train a classifier (XGBoost or LightGBM) to predict top24.
+Also train a regression model to predict FPTS as a secondary target (same CV).
+Use Optuna to tune hyperparameters (limit trials e.g., 50) on training folds only.
+Metrics & evaluation:
+
+Classification metrics: AUC-ROC, precision@k (k=12,24), recall@k, F1, calibration plot (reliability).
+Regression metrics: RMSE, MAE, R2; precision@k using predicted FPTS ranking.
+Produce a fold‑wise and aggregate report: mean and std for metrics.
+Output confusion matrices and precision@k bar charts.
+Model interpretation:
+
+Provide global feature importance (gain/SHAP), and a SHAP summary plot.
+For a few example players show SHAP force plots (or waterfall style) that explain predicted probability.
+Apply to 2025 projections:
+
+Map 2025 projection columns into the same feature set. Where projection file lacks required features (e.g., TGT, AIR or %TM), impute:
+If TGT missing but REC present, impute TGT = REC / historical_catch_rate (use player's 2024 catch_rate, else league median).
+If AIR missing, impute AIR using player's historical AIR or cohort median scaled by projected REC_per_game.
+Flag imputed values with boolean columns.
+For players missing lag1 historical data, use cohort medians for lag features and mark them as new players.
+Use the trained classifier to compute:
+P(top24) and P(top12) probabilities
+predicted FPTS from regression model (and 95% prediction interval from CV residuals)
+Output a predictions CSV with columns: player, team, proj_REC, proj_YDS, proj_TDS, proj_FPTS, P_top24, P_top12, predicted_FPTS_reg, TPS (composite score), imputed_flags.
+Tiering & explainable output:
+
+Define tiers based on P_top24 and predicted_FPTS:
+Elite WR1: P_top24 >= 0.8 and predicted_FPTS >= 170
+High WR1: 0.6 <= P_top24 < 0.8
+WR2: 0.3 <= P_top24 < 0.6
+WR3/Bust: P_top24 < 0.3
+Output a JSON or CSV with player → tier, probabilities, and top contributing features (from SHAP) per player.
+Robustness & edge cases
+
+Handle name collisions and duplicates (if a player appears multiple times in the same season, merge and sum relevant stats).
+If a player has 0 targets/TGT missing, avoid divide-by-zero.
+Record and propagate uncertainty flags for imputed or projected-only players.
+Code structure & deliverables
+
+A modular package or scripts:
+data_ingest.py — reads/normalizes CSVs
+features.py — feature engineering & imputation
+train.py — training, CV, hyperparam tuning, metrics
+predict.py — load model + apply to 2025 projections, output predictions
+explain.py — SHAP analyses and plots
+notebooks/analysis.ipynb — EDA and sample run
+tests/: unit tests for key functions (name normalization, imputation, label creation)
+README.md — how to run, expected outputs, dependencies, and TL;DR of the logic
+Save artifacts:
+models/classifier.joblib (or model.bin), models/regressor.joblib
+outputs/2025_predictions.csv (with probabilities and tiers)
+outputs/metrics_report.md and visualizations (roc.png, precision_at_k.png, shap_summary.png)
+Include a small sample CLI: python train.py --data-dir data/pro/wr --out-dir outputs --seed 42
+Acceptance criteria
+Code runs end‑to‑end on provided CSVs and produces outputs above.
+CV results (leave‑one‑season‑out) are printed and saved; classification AUC should be >0.80 if features are strong (report actual).
+predictions CSV contains P_top24 and tier for every player in 2025WRPROJ.csv.
+Provide a short README paragraph explaining imputation choices and recommended follow‑up checks.
+Optional advanced improvements (nice to have)
+
+Use time‑aware features like rolling 2‑season trends and age curves.
+Train a hierarchical model that first predicts target share then converts to yards/TDs.
+Provide a calibration step (Platt/isotonic) for classifier probabilities.
+Add an uncertainty ensemble: train several randomized seeds/models and provide mean & std of predicted probabilities.
+End of prompt
+
+Notes / Tips for the assistant you call
+
+Be explicit about column names encountered in the CSVs (they use quoted headers). Normalize and map them into snake_case.
+Use season as the CV unit to avoid target leakage.
+Persist preprocessing pipeline (scaler, encoders, imputation rules) with joblib so the same transformations apply to 2025 projections.
+If you want, I can:
+
+produce an executable starter repository scaffold (file list + minimal code) you can drop into your project, or
+generate the full Python scripts and a runnable notebook implementing this pipeline end‑to‑end. Which would you prefer?
