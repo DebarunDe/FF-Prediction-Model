@@ -143,3 +143,154 @@ Be explicit in code comments about the pass vs rush duplicate headers in 2025QBP
 Keep the scoring function configurable and isolated so it can be changed easily.
 Make sure the pipeline runs end-to-end on a machine with only the repo and data/pro/qb files (i.e., don't require external APIs).
 Keep runtime reasonable: XGBoost params above are fine; parallelize simulations if possible.
+
+Goal
+
+Build a reproducible data pipeline (ETL + analysis + reports) for running back (RB) season stats and projections. The pipeline must ingest the historical RB CSVs (2020–2025) and the 2025 projections (2025RBPROJ.csv), compute standardized metrics and composite “top performer” scores, produce ranked outputs and visualizations, and include tests, documentation, and reproducible execution (Docker and/or Make).
+Primary inputs (relative paths)
+
+data/pro/rb/2020RB.csv
+data/pro/rb/2020RBADD.csv
+data/pro/rb/2021RB.csv
+data/pro/rb/2021RBADD.csv
+data/pro/rb/2022RB.csv
+data/pro/rb/2022RBADD.csv
+data/pro/rb/2023RB.csv
+data/pro/rb/2023RBADD.csv
+data/pro/rb/2024RB.csv
+data/pro/rb/2024RBADD.csv
+data/pro/rb/2025RB.csv
+data/pro/rb/2025RBADD.csv
+data/pro/rb/2025RBPROJ.csv
+Target outputs
+
+outputs/rb_historical_clean.csv — cleaned, normalized historical rows (one row per player-season) with canonical column names.
+outputs/2025_projections_clean.csv — cleaned projections.
+outputs/rb_percentiles_historical.csv — percentiles computed from historical seasons for metrics used.
+outputs/2025_projected_percentiles.csv — projections mapped to historical percentiles.
+outputs/2025_composite_scores.csv — each projected RB with component percentiles, composite score(s), rank(s), archetype, and risk flags.
+outputs/figures/* — key plots (scatter, histograms, time series) in PNG/SVG.
+docs/methodology.md — explanation of scoring, formulas, and how weights can be tuned.
+tests/ — unit tests validating parsing, key numeric computations, and end‑to‑end pipeline run.
+Dockerfile and Makefile (or task runner) to run pipeline reproducibly with one command.
+Implementation requirements & conventions
+
+Language: Python 3.10+ (use virtualenv/venv). Use pandas for tabular ETL. numpy, scipy or scikit-learn permitted for stats. matplotlib/seaborn/plotly for visuals. joblib for caching optional.
+Code layout: src/etl.py, src/metrics.py, src/scoring.py, src/visualize.py, src/cli.py, notebooks/analysis.ipynb.
+Config: config.yml with:
+input_paths: historical_dir, projections_file
+output_dir
+composite_weights: {att:0.30, rec:0.25, eff:0.20, tds:0.15, dur:0.10}
+ranking_mode: ['season_total','weekly_floor'] (explain differences)
+percentile_method: ['historical','cohort_zscore']
+Logging and errors: robust logging (info/debug). Fail early with clear messages when required columns missing. Gracefully handle malformed rows.
+Cleaning & parsing details
+
+CSVs contain quoted fields, commas in thousands, empty rows at file end. Robustly parse:
+Strip leading/trailing quotes.
+Normalize thousands separators (e.g., "2,027" -> 2027).
+Convert "(FA)" or team tags in Player name to separate Player / Team columns where available. If Team is in projections, prefer that.
+Trim whitespace and drop completely empty rows.
+Canonical columns expected (examples): Year, Player, Team, G, ATT, Rush_YDS, Rush_TDS, REC, Rec_YDS, Rec_TDS, Fumbles, TGT, RZ_TGT, FPTS (where available), RostPercent (if present). If a metric is missing in a source, fill with NaN and document.
+Feature engineering
+
+Compute derived metrics per row:
+YPC = Rush_YDS / ATT (handle ATT==0)
+Total_TDs = Rush_TDS + Rec_TDS
+Total_Yds = Rush_YDS + Rec_YDS
+FPTS_per_game = FPTS / G (if FPTS present)
+YBCON/ATT and YACON/ATT if columns available; else fallback to available proxies.
+Standardize names (normalize casing). De‑duplicate players with identical name + year (sum counts or keep the record with largest ATT; prefer documented rule).
+Percentiles & standardization
+
+Build historical distributions using one row per player-season across 2020–2024 (optionally include 2025 if desired).
+For each metric used in scoring (ATT, REC, YPC, Total_TDs, Total_Yds, RZ_TGT if available, FPTS/G if available), compute percentile rank (0 to 1) for the historical distribution.
+Save percentiles to outputs/rb_percentiles_historical.csv.
+Composite scoring
+
+Default composite (season-total oriented): Score = 0.30 * P_ATT + 0.25 * P_REC + 0.20 * P_EFF + 0.15 * P_TD + 0.10 * P_DUR
+P_ATT = percentile(ATT)
+P_REC = percentile(REC + normalized TGT if available) — choose REC primarily
+P_EFF = percentile(YPC) or blended percentile(YPC, Total_Yds/ATT)
+P_TD = percentile(Total_TDs)
+P_DUR = percentile(G or ATT)
+Weekly-floor mode: increase weight on P_REC and P_FPTS/G.
+Implement ability to:
+Accept a config with alternative weights
+Include an optional interaction bonus: if P_ATT > 0.8 and P_EFF > 0.8 then +bonus 0.03 (tunable)
+Output composite score [0..100] and normalized rank.
+Archetype & risk tags
+
+Assign an archetype label based on rules:
+“Bell-Cow” if ATT percentile ≥ 0.75 and REC percentile ≤ 0.40
+“Three-Down” if ATT P ≥ 0.60 and REC P ≥ 0.60
+“Explosive” if YPC P ≥ 0.80 with ATT P between 0.30–0.60
+“Committee” otherwise
+Add risk flags:
+Low-volume risk: ATT < threshold (configurable)
+Injury risk: historical games played trend shows decline (if past data available)
+Regression risk: projected YPC > historical 90th pct and ATT very high (possible regression)
+Analysis & visualization
+
+Plots to produce:
+Top scatter: ATT vs YPC with point size by Total_TDs and color by archetype; label top 25.
+Percentile heatmap for top N (e.g., top 50 projected) showing P_ATT, P_REC, P_EFF, P_TD.
+Time series of a selected player showing ATT, YDS, REC, FPTS across years.
+Correlation matrix (pearson) of key metrics across the historical dataset: ATT, REC, YPC, Total_TDs, FPTS.
+Distribution plots for ATT, YPC, REC for historical vs 2025 projections.
+Save all plots to outputs/figures with descriptive filenames.
+Testing & validation
+
+Unit tests must cover:
+CSV parsing of a provided sample with quoted thousands separators and trailing empty rows.
+Correct calculation of YPC and Total_TDs, including ATT==0 handling.
+Percentile calculation correctness on a small synthetic dataset (include fixed expected percentiles).
+Composite score calculation given a known set of percentiles and weights.
+Integration / e2e test:
+A pipeline smoke test: run pipeline on a small subset of files and assert outputs exist, top‑ranked player is expected based on sample data.
+Provide a simple test dataset in tests/data/ to run in CI.
+Reproducibility & packaging
+
+Provide a Dockerfile (python slim) that installs requirements and runs the pipeline; or provide a Makefile with:
+make venv
+make install
+make run (runs ETL -> scoring -> visuals)
+make test
+Pin dependencies in requirements.txt. Provide runtime instructions in README.md.
+Performance & scale
+
+Target: handle >10k rows easily on single machine. Use vectorized pandas operations. Use chunked CSV reading if memory constrained. Cache intermediate cleaned data to outputs/cache/.
+Acceptance criteria
+
+Running the pipeline (make run or docker run) processes input CSVs and writes the target outputs listed above.
+The top 50 composite scores are saved in outputs/2025_composite_scores.csv with Player, Team, composite_score, rank, archetype, risk_flags, and component percentiles.
+Tests pass (make test).
+docs/methodology.md documents formulas and how to change weights and percentile source.
+Code is modular, documented, and unit-tested.
+Example CLI usage
+
+python -m src.cli run --config config.yml
+python -m src.cli score --projections data/pro/rb/2025RBPROJ.csv --out outputs/2025_composite_scores.csv
+python -m src.cli visualize --players "Saquon Barkley, Bijan Robinson" --out outputs/figures/
+Example expected final CSV header (outputs/2025_composite_scores.csv)
+
+Player, Team, ATT, Rush_YDS, Rush_TDS, REC, Rec_YDS, Rec_TDS, Total_TDs, YPC, Total_YDS, P_ATT, P_REC, P_EFF, P_TD, P_DUR, composite_score, rank, archetype, risk_flags
+Bonus tasks (optional, mark in config)
+
+Add a small ML model (linear regression / random forest) trained on historical seasons to predict FPTS from components (ATT, REC, YPC, TDs), showing model feature importances and using cross‑validation — then compare projected FPTS to model prediction and flag outliers.
+Add a simple dashboard (Streamlit/Voila) for interactive exploration.
+Deliverables
+
+src/ package with code files.
+requirements.txt, Dockerfile, Makefile.
+config.yml example.
+README.md with run instructions.
+outputs/ CSVs and figures after a pipeline run.
+docs/methodology.md and notebooks/analysis.ipynb.
+tests/ unit and integration tests.
+Notes for the assistant
+
+Ask a single clarifying question only if a critical input is missing (e.g., do you want to include 2025 historical rows in percentiles?). Otherwise implement defaults above and document them in docs/methodology.md.
+Keep the code modular and well-documented. Add inline comments for any domain‑specific logic (e.g., archetype thresholds).
+Provide a short usage README at the end of the PR and a summary of results (top 10 scored RBs and a couple of generated plots).
+
